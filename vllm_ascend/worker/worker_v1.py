@@ -49,6 +49,8 @@ from vllm_ascend.utils import (init_ascend_soc_version,
                                register_ascend_customop, sleep_mode_enabled,
                                try_register_lib, vllm_version_is)
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.npu_epd_lm_wrapper import DisaggLModelNPURunnerWrapper
+from vllm_ascend.worker.npu_epd_vm_wrapper import DisaggVModelNPURunnerWrapper
 
 if not (vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1")):
     from vllm.v1.outputs import DraftTokenIds
@@ -101,6 +103,11 @@ class NPUWorker(WorkerBase):
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils import init_cached_hf_modules
             init_cached_hf_modules()
+        
+        self.separated_encode: bool = False
+        if self.vllm_config.epd_disagg_config.instance_type != "NoEPD":
+            self.separated_encode = True
+            self.instance_type = self.vllm_config.epd_disagg_config
 
         self.profiler = self._init_profiler()
 
@@ -148,7 +155,14 @@ class NPUWorker(WorkerBase):
     def init_device(self):
         device = self._init_device()
         # Init ModelRunner here, so that we have access to self.device.
-        self.model_runner = NPUModelRunner(self.vllm_config, device)
+        self.model_runner: Union[DisaggLModelNPURunnerWrapper, DisaggVModelNPURunnerWrapper, NPUModelRunner]
+        model_runner_class = NPUModelRunner
+        if self.separated_encode:
+            if self.instance_type == "encode":
+                model_runner_class = DisaggVModelNPURunnerWrapper
+            elif (self.instance_type == "prefill+decode" or self.instance_type == "prefill"):
+                model_runner_class = DisaggLModelNPURunnerWrapper
+        self.model_runner = model_runner_class(self.vllm_config, device)
 
     def determine_available_memory(self) -> int:
         # Profile the memory usage of the model and get the maximum number of

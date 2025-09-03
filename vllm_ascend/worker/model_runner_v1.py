@@ -21,6 +21,7 @@ import copy
 import gc
 import math
 import time
+import threading
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Union, cast
@@ -195,6 +196,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # TODO: remove Dict[str, Dict[int, torch.Tensor]] type after 0.10.1.1
         self.encoder_cache: Union[Dict[str, Dict[int, torch.Tensor]],
                                   Dict[str, torch.Tensor]] = {}
+        self.encoder_cache_lock: threading.Lock = threading.Lock()
         self.attn_mask = None
         self.attn_state = None
         self.requests: Dict[str, CachedRequestState] = {}
