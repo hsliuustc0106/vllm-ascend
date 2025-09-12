@@ -24,7 +24,7 @@ import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Union, cast
-
+import os  # 新增：用于读取环境变量
 import numpy as np
 import numpy.typing as npt
 import torch
@@ -372,6 +372,19 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             dtype=torch.bool,
             device=self.device,
         )
+        # ---------------- 新增：计时相关开关与数据结构 ----------------
+        self.enable_mm_timing = bool(int(os.environ.get("VLLM_ASCEND_MM_TIMING", "0")))  # 多模态与LLM基础计时开关
+        self.enable_chunk_prefill_timing = bool(int(os.environ.get("VLLM_ASCEND_CHUNK_PREFILL_TIMING", "0")))  # Chunked Prefill细粒度统计开关
+
+        # 结构：{
+        #   req_id: {
+        #       "total_tokens": 已累计的预填充token数量,
+        #       "device_ms": 设备侧累计耗时,
+        #       "wall_ms": Wall累计耗时,
+        #       "prompt_tokens": 该请求完整prompt长度（缓存方便判定是否结束）
+        #   }, ...
+        # }
+        self._chunked_prefill_accumulator = {}  # 存储每个请求的Chunked Prefill累积数据
 
     def _use_aclgraph(self) -> bool:
         return self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and self.compilation_config.level == CompilationLevel.PIECEWISE and not self.model_config.enforce_eager
@@ -928,11 +941,18 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # multimodal inputs. The proper solution should be reordering the
         # encoder outputs.
         encoder_outputs = []
-        for _, num_items, mm_kwargs_group in group_mm_kwargs_by_modality(
-                mm_kwargs,
-                device=self.device,
-                pin_memory=True,
-        ):
+         # 图像编码计时（批内合计）
+        if self.enable_mm_timing:
+            cpu_pre_time_start = time.perf_counter()
+
+        grouped_info = list(group_mm_kwargs_by_modality(
+            mm_kwargs,
+            device=self.device,
+            pin_memory=True,
+        ))
+        if self.enable_mm_timing:
+            cpu_pre_time_mid = time.perf_counter()
+        for _, num_items, mm_kwargs_group in grouped_info:
             # Run the encoder.
             # `curr_group_outputs` is either of the following:
             # 1. A tensor of shape (num_items, feature_size, hidden_size)
@@ -940,9 +960,21 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # 2. A list or tuple (length: num_items) of tensors, each of shape
             # (feature_size, hidden_size) in case the feature size is dynamic
             # depending on the input multimodal items.
+            # NPU Event 记录编码部分
+            if self.enable_mm_timing:
+                enc_start_evt = torch.npu.Event(enable_timing=True)
+                enc_end_evt = torch.npu.Event(enable_timing=True)
+                enc_start_evt.record()
             curr_group_outputs = self.model.get_multimodal_embeddings(
                 **mm_kwargs_group)
-
+            if self.enable_mm_timing:
+                enc_end_evt.record()
+                torch.npu.synchronize()
+                elapsed_ms = enc_start_evt.elapsed_time(enc_end_evt)
+                logger.info(
+                    f"[MM] Image Encoding Time (group items={num_items}): "
+                    f"{elapsed_ms:.3f} ms"
+                )
             sanity_check_mm_encoder_outputs(
                 curr_group_outputs,
                 expected_num_items=num_items,
@@ -950,6 +982,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
             for output in curr_group_outputs:
                 encoder_outputs.append(output)
+        
+        if self.enable_mm_timing:
+            cpu_pre_time_end = time.perf_counter()
+            logger.info(
+                "[MM] Image Pre+Batch Build Time (host) = "
+                f"{(cpu_pre_time_mid - cpu_pre_time_start)*1000:.3f} ms ; "
+                f"ScatterTime+Loop (host) = {(cpu_pre_time_end - cpu_pre_time_mid)*1000:.3f} ms"
+            )
         if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
             # Cache the encoder outputs.
             for (req_id, input_id, pos_info), output in zip(
@@ -1638,6 +1678,80 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         return moe_comm_method
 
+    def _update_chunked_prefill_stats(self,
+                                      scheduler_output,
+                                      step_device_ms: float,
+                                      step_wall_ms: float,
+                                      attn_state) -> None:
+        """
+        
+        在一次 forward（可能是 Chunked Prefill 的一个分片）后更新所有请求的统计；
+        如果某个请求在本次 step 后其 prompt 部分已经全部预填充完成，则输出该请求的聚合日志并移除。
+        """
+        if not self.enable_chunk_prefill_timing:
+            return
+        if attn_state != AscendAttentionState.ChunkedPrefill:
+            return  # 只在ChunkedPrefill阶段累积
+
+        # 当前 step 中每个请求被调度的 token 数
+        # scheduler_output.num_scheduled_tokens: Dict[req_id] = num_tokens_this_step
+        finished_req_ids = []
+        num_reqs = len(self.input_batch.req_ids)
+
+        # 为了将本次 step 的总耗时按“token 权重”拆分给各 request：
+        # 计算本 step 所有请求 token 总和
+        total_step_tokens = sum(
+            scheduler_output.num_scheduled_tokens[req_id]
+            for req_id in self.input_batch.req_ids
+        ) or 1  # 防止除0
+
+        for req_id in self.input_batch.req_ids:
+            step_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            # 计算本 request 分摊的时间（线性按 token 权重分配）
+            portion = step_tokens / total_step_tokens
+            portion_device = step_device_ms * portion
+            portion_wall = step_wall_ms * portion
+
+            req_state = self.requests[req_id]
+            prompt_len = len(req_state.prompt_token_ids)
+
+            acc = self._chunked_prefill_accumulator.get(req_id)
+            if acc is None:
+                acc = {
+                    "total_tokens": 0,
+                    "device_ms": 0.0,
+                    "wall_ms": 0.0,
+                    "prompt_tokens": prompt_len,
+                }
+                self._chunked_prefill_accumulator[req_id] = acc  # 首次出现初始化累积结构
+
+            acc["total_tokens"] += step_tokens
+            acc["device_ms"] += portion_device
+            acc["wall_ms"] += portion_wall
+
+            # 判定该请求是否已完成其 prompt 的全部预填（含 Chunked）：
+            # num_computed_tokens 在 _update_states 调用前是旧值，execute_model 里我们已进入 forward 之后，
+            # 此时 req_state.num_computed_tokens 尚未包含本 step 计算的 token，所以需要使用：
+            #   已计算 + 本次调度 >= prompt_len 说明 prompt 预填完成
+            computed_after_step = req_state.num_computed_tokens + step_tokens
+            if computed_after_step >= prompt_len:
+                # 输出该请求的汇总日志
+                logger.info(
+                    "[ChunkedPrefill][Req=%s] 完成预填充: prompt_tokens=%d, 累计处理=%d, "
+                    "累计设备时间=%.3f ms, 累计Wall时间=%.3f ms, 平均设备(ms/token)=%.4f",
+                    req_id,
+                    prompt_len,
+                    acc["total_tokens"],
+                    acc["device_ms"],
+                    acc["wall_ms"],
+                    acc["device_ms"] / max(1, acc["total_tokens"])
+                )
+                finished_req_ids.append(req_id)
+
+        # 清理已完成的请求
+        for rid in finished_req_ids:
+            self._chunked_prefill_accumulator.pop(rid, None)
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1666,6 +1780,19 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                            uniform_decode=False)
         aclgraph_runtime_mode, batch_descriptor = \
             self.aclgraph_dispatcher.dispatch(batch_descriptor)
+        
+        # 在 forward 前后插入 Prefill 计时
+        is_prefill_phase = self.attn_state in (
+            AscendAttentionState.PrefillNoCache,
+            AscendAttentionState.ChunkedPrefill,
+            AscendAttentionState.PrefillCacheHit,
+        )
+        is_chunked_prefill = (self.attn_state == AscendAttentionState.ChunkedPrefill)  # 专门标记Chunked Prefill
+        if (self.enable_mm_timing or self.enable_chunk_prefill_timing) and is_prefill_phase:
+            prefill_start_evt = torch.npu.Event(enable_timing=True)  # 设备事件开始
+            prefill_end_evt = torch.npu.Event(enable_timing=True)    # 设备事件结束
+            prefill_start_evt.record()
+            wall_prefill_start = time.perf_counter()  # Wall时间起点
 
         # Run forward pass
         with ProfileExecuteDuration().capture_async("forward"):
@@ -1695,6 +1822,31 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
 
+        if (self.enable_mm_timing or self.enable_chunk_prefill_timing) and is_prefill_phase:
+            prefill_end_evt.record()
+            torch.npu.synchronize()
+            wall_prefill_end = time.perf_counter()
+            device_ms = prefill_start_evt.elapsed_time(prefill_end_evt)
+            wall_ms = (wall_prefill_end - wall_prefill_start) * 1000
+
+            phase_name = "ChunkedPrefill" if is_chunked_prefill else \
+                         ("PrefillCacheHit" if self.attn_state == AscendAttentionState.PrefillCacheHit
+                          else "Prefill")
+            # 基础日志（单 step）
+            if self.enable_mm_timing:
+                logger.info(
+                    f"[LLM]{phase_name} Step Time: device={device_ms:.3f} ms wall={wall_ms:.3f} ms "
+                    f"(step_tokens={scheduler_output.total_num_scheduled_tokens}, batch_reqs={len(self.input_batch.req_ids)})"
+                )
+
+            # 若开启Chunked Prefill聚合统计，则更新累计并在必要时输出聚合
+            if self.enable_chunk_prefill_timing and is_chunked_prefill:
+                self._update_chunked_prefill_stats(
+                    scheduler_output,
+                    step_device_ms=device_ms,
+                    step_wall_ms=wall_ms,
+                    attn_state=self.attn_state
+                )
         kv_connector_output = None
         if finished_sending is not None or finished_recving is not None:
             kv_connector_output = KVConnectorOutput(
