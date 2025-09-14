@@ -37,8 +37,10 @@ import torchair
 from torchair import patch_for_hcom
 from vllm.attention import AttentionType, get_attn_backend
 from vllm.attention.layer import Attention
-from vllm.config import CompilationLevel, VllmConfig
+from vllm.config import CompilationLevel, ECProducer, ECConnectorConfig, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed.ec_transfer import (get_ec_transfer,
+                                          has_ec_transfer)
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
@@ -58,8 +60,10 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         LayerBlockType, LazyLoader, cdiv)
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
-                                        KVCacheSpec)
-from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+                                        KVCacheSpec, make_empty_encoder_model_runner_output)
+from vllm.v1.outputs import (ECConnectorOutput, EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
+                             ModelRunnerOutput)
+from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -72,6 +76,7 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (gather_mm_placeholders,
                                   sanity_check_mm_encoder_outputs,
                                   scatter_mm_placeholders)
+from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
@@ -138,7 +143,7 @@ def graph_capture(device: torch.device):
         yield graph_capture_context
 
 
-class NPUModelRunner(LoRAModelRunnerMixin):
+class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -826,6 +831,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 output,
                 is_embed=pos_info.is_embed,
             )
+            self.maybe_save_ec_to_connector(self.encoder_cache,
+                                                request_id=req_id,
+                                                input_id=input_id)
 
     def _gather_mm_embeddings(
         self,
@@ -1095,9 +1103,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
         if self.is_multimodal_model:
-            # Run the multimodal encoder if any.
-            self._execute_mm_encoder(scheduler_output)
-            mm_embeds = self._gather_mm_embeddings(scheduler_output)
+            with self.maybe_get_ec_connector_output(
+                    scheduler_output,
+                    encoder_cache=self.encoder_cache,
+            ) as ec_connector_output:
+                # Run the multimodal encoder if any.
+                self._execute_mm_encoder(scheduler_output)
+                mm_embeds = self._gather_mm_embeddings(scheduler_output)
         else:
             mm_embeds = []
 
@@ -1376,6 +1388,61 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 hidden_states, attn_metadata)
         return spec_token_ids
 
+    def _pool(
+        self,
+        hidden_states: torch.Tensor,
+        num_scheduled_tokens: int,
+        num_scheduled_tokens_np: np.ndarray,
+        finished_sending: Optional[set[str]] = None,
+        finished_recving: Optional[set[str]] = None,
+        kv_connector_output: Optional["KVConnectorOutput"] = None,
+        ec_connector_output: Optional["ECConnectorOutput"] = None,
+    ) -> ModelRunnerOutput:
+        assert self.input_batch.num_reqs ==\
+            len(self.input_batch.pooling_params), \
+        "Either all or none of the requests in" \
+        " a batch must be pooling request"
+
+        extracted_hidden_states = list(
+            torch.split(hidden_states[:num_scheduled_tokens],
+                        num_scheduled_tokens_np.tolist()))
+
+        pooling_metadata = self.input_batch.pooling_metadata
+
+        raw_pooler_output = self.model.pooler(
+            hidden_states=extracted_hidden_states,
+            pooling_metadata=pooling_metadata)
+
+        pooler_output: list[Optional[torch.Tensor]] = []
+        seq_lens = self.seq_lens[:self.input_batch.num_reqs]
+        for raw_output, seq_len, prompt_len in zip(
+                raw_pooler_output, seq_lens, pooling_metadata.prompt_lens):
+
+            if seq_len == prompt_len:
+                pooler_output.append(raw_output.data.cpu())
+            else:
+                pooler_output.append(None)
+        extra_args = ({
+            "finished_sending": finished_sending,
+            "finished_recving": finished_recving
+        } if vllm_version_is("0.10.0") else {
+            "kv_connector_output": kv_connector_output
+        })
+        if self.is_multimodal_model and ec_connector_output is not None:
+            extra_args.update({
+                "ec_connector_output": ec_connector_output
+            })
+        return ModelRunnerOutput(
+            req_ids=self.input_batch.req_ids,
+            req_id_to_index=self.input_batch.req_id_to_index,
+            sampled_token_ids=[],
+            spec_token_ids=None,
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=pooler_output,
+            **extra_args,
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1385,6 +1452,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         with ProfileExecuteDuration().capture_async(
                 "prepare input and forward"):
             self._update_states(scheduler_output)
+            if has_ec_transfer() and get_ec_transfer().is_producer:
+                with self.maybe_get_ec_connector_output(
+                        scheduler_output,
+                        encoder_cache=self.encoder_cache,
+                ) as ec_connector_output:
+                    self._execute_mm_encoder(scheduler_output)
+                    return make_empty_encoder_model_runner_output(scheduler_output)
+
             if not scheduler_output.total_num_scheduled_tokens:
                 if not has_kv_transfer_group():
                     logger.debug(
@@ -1406,8 +1481,44 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 self.eplb_updator.take_update_info_from_eplb_process()
 
         with ProfileExecuteDuration().capture_async("post process"):
-            logits = self.model.compute_logits(hidden_states[sample_indices],
-                                               None)
+            # Broadcast PP output for external_launcher (torchrun)
+            # to make sure we are synced across pp ranks
+            # TODO: Support overlapping mirco-batches
+            # https://github.com/vllm-project/vllm/issues/18019
+            broadcast_pp_output = \
+                self.parallel_config.distributed_executor_backend \
+                == "external_launcher" and len(get_pp_group().ranks) > 0
+            if not get_pp_group().is_last_rank:
+                # For mid-pipeline stages, return the hidden states.
+                if not broadcast_pp_output:
+                    if kv_connector_output is not None:
+                        hidden_states.kv_connector_output = kv_connector_output
+                    else:
+                        #TODO: Remove this after we drop vllm v0.10.0
+                        hidden_states.finished_sending = finished_sending
+                        hidden_states.finished_recving = finished_recving
+                    return hidden_states
+                assert isinstance(hidden_states, IntermediateTensors)
+                get_pp_group().send_tensor_dict(
+                    hidden_states.tensors, all_gather_group=get_tp_group())
+                logits = None
+            else:
+                if self.input_batch.pooling_params:
+                    return self._pool(hidden_states, num_scheduled_tokens,
+                                      num_scheduled_tokens_np,
+                                      finished_sending, finished_recving,
+                                      kv_connector_output, ec_connector_output)
+                sample_hidden_states = hidden_states[logits_indices]
+                logits = self.model.compute_logits(sample_hidden_states, None)
+            if broadcast_pp_output:
+                model_output_broadcast_data = {
+                    "logits": logits.contiguous(),
+                } if logits is not None else {}
+                model_output_broadcast_data = get_pp_group(
+                ).broadcast_tensor_dict(model_output_broadcast_data,
+                                        src=len(get_pp_group().ranks) - 1)
+                assert model_output_broadcast_data is not None
+                logits = model_output_broadcast_data["logits"]
 
             # Apply structured output bitmasks if present
             if scheduler_output.grammar_bitmask is not None:
@@ -2088,6 +2199,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             format. Layers that do not need KV cache are not included.
         """
 
+        if has_ec_transfer() and get_ec_transfer().is_producer:
+            return {}
         forward_ctx = self.vllm_config.compilation_config.static_forward_context
         block_size = self.vllm_config.cache_config.block_size
         use_mla = self.vllm_config.model_config.use_mla
