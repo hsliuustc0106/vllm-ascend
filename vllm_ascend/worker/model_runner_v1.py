@@ -37,7 +37,7 @@ import torchair
 from torchair import patch_for_hcom
 from vllm.attention import AttentionType, get_attn_backend
 from vllm.attention.layer import Attention
-from vllm.config import CompilationLevel, ECProducer, ECConnectorConfig, VllmConfig
+from vllm.config import CompilationLevel, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.distributed.ec_transfer import (get_ec_transfer,
                                           has_ec_transfer)
@@ -60,9 +60,9 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         LayerBlockType, LazyLoader, cdiv)
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
-                                        KVCacheSpec, make_empty_encoder_model_runner_output)
+                                        KVCacheSpec)
 from vllm.v1.outputs import (ECConnectorOutput, EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
-                             ModelRunnerOutput)
+                             ModelRunnerOutput, make_empty_encoder_model_runner_output)
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
