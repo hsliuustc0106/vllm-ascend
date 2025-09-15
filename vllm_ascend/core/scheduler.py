@@ -14,6 +14,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
+import os
 import time
 from collections import deque
 from typing import Iterable, Union
@@ -57,6 +58,7 @@ class AscendScheduler(Scheduler):
                          include_finished_set, log_stats)
         self.scheduled_req_ids: set[str] = set()
         self.running: list[Request] = []
+        self.enable_ttft = bool(int(os.environ.get("VLLM_ASCEND_TTFT", "0")))  # 仅统计 Encoder + Prefill 的 TTFT
 
     def schedule(self) -> SchedulerOutput:
         if self.scheduler_config.chunked_prefill_enabled:
@@ -85,10 +87,11 @@ class AscendScheduler(Scheduler):
         # and put back at the head of the waiting queue later
         skipped_waiting_requests: deque[Request] = deque()
 
-        for req in self.waiting:
-            if getattr(req, "first_arrival_ts", None) is None:
-                # 记录首个到达时间
-                setattr(req, "first_arrival_ts", time.perf_counter())
+        if self.enable_ttft:
+            for req in self.waiting:
+                if getattr(req, "first_arrival_ts", None) is None:
+                    # 记录首个到达时间
+                    setattr(req, "first_arrival_ts", time.perf_counter())
 
         # Schedule prefill requests first.
         while self.waiting and token_budget > 0:
@@ -225,8 +228,9 @@ class AscendScheduler(Scheduler):
             # Check request status.
             if request.status == RequestStatus.WAITING:
                 scheduled_new_reqs.append(request)
-                if getattr(request, "schedule_ts", None) is None:
-                    setattr(request, "schedule_ts", time.perf_counter())
+                if self.enable_ttft:
+                    if getattr(request, "schedule_ts", None) is None:
+                        setattr(request, "schedule_ts", time.perf_counter())
             elif request.status == RequestStatus.PREEMPTED:
                 scheduled_resumed_reqs.append(request)
             else:

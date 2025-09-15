@@ -391,6 +391,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self._chunked_prefill_accumulator = {}  # 存储每个请求的Chunked Prefill累积数据
         self._ttft_reqs = {}
 
+        # 环境开关：多模态编码内存统计
+        self.enable_mm_mem = bool(int(os.environ.get("VLLM_ASCEND_MM_MEM", "0")))
+        # 记录每种 group_items (视为“视觉batch size”) 的聚合
+        # 结构: {bs: {"count": n次, "delta_MB_total":..., "peak_MB_max":..., "alloc_after_MB_last": ...}}
+        self._mm_mem_stats = {}
+        # 是否在本 step 的 encoder 之前重置过峰值
+        self._mm_mem_step_reset_done = False
+
     def _use_aclgraph(self) -> bool:
         return self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and self.compilation_config.level == CompilationLevel.PIECEWISE and not self.model_config.enforce_eager
 
@@ -975,7 +983,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         ))
         if self.enable_mm_timing:
             cpu_pre_time_mid = time.perf_counter()
-        for _, num_items, mm_kwargs_group in grouped_info:
+
+        do_mem = self.enable_mm_mem
+        if do_mem:
+            torch.npu.reset_peak_memory_stats()
+        for modality, num_items, mm_kwargs_group in grouped_info:
             # Run the encoder.
             # `curr_group_outputs` is either of the following:
             # 1. A tensor of shape (num_items, feature_size, hidden_size)
@@ -995,8 +1007,41 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 evt_e = torch.npu.Event(enable_timing=True)
                 evt_s.record()
                 wall_s = time.perf_counter()
+            
+            if do_mem:
+                # 第一个 group （或者每个 group 前）可选择是否 reset 峰值
+                # 如果想每个 group 独立峰值：重置放这里；如果想整次 encoder 看一个峰值，就放在循环外。
+                # 这里选择“每个 group 单独统计”：
+                mem_before = torch.npu.memory_allocated()
+
             curr_group_outputs = self.model.get_multimodal_embeddings(
                 **mm_kwargs_group)
+            
+            if do_mem:
+                torch.npu.synchronize()
+                mem_after = torch.npu.memory_allocated()
+                peak = torch.npu.max_memory_allocated()
+
+                delta = mem_after - mem_before
+                # 转 MB
+                mem_before_mb = mem_before / 1024 / 1024
+                mem_after_mb = mem_after / 1024 / 1024
+                delta_mb = delta / 1024 / 1024
+                peak_mb = peak / 1024 / 1024
+
+                # 记录按 num_items 聚合
+                stat = self._mm_mem_stats.setdefault(num_items, {
+                    "count": 0,
+                    "delta_MB_total": 0.0,
+                    "peak_MB_max": 0.0,
+                    "alloc_after_MB_last": 0.0,
+                })
+                stat["count"] += 1
+                stat["delta_MB_total"] += delta_mb
+                if peak_mb > stat["peak_MB_max"]:
+                    stat["peak_MB_max"] = peak_mb
+                stat["alloc_after_MB_last"] = mem_after_mb
+
             if self.enable_mm_timing:
                 enc_end_evt.record()
                 torch.npu.synchronize()
@@ -1833,12 +1878,17 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             AscendAttentionState.ChunkedPrefill,
             AscendAttentionState.PrefillCacheHit,
         )
+        is_decode_phase = self.attn_state in (AscendAttentionState.DecodeOnly) # decode阶段
         is_chunked_prefill = (self.attn_state == AscendAttentionState.ChunkedPrefill)  # 专门标记Chunked Prefill
         if (self.enable_mm_timing or self.enable_chunk_prefill_timing) and is_prefill_phase:
-            prefill_start_evt = torch.npu.Event(enable_timing=True)  # 设备事件开始
+            prefill_start_evt = torch.npu.Event(enable_timing=True)  # prefill开始
             prefill_end_evt = torch.npu.Event(enable_timing=True)    # 设备事件结束
             prefill_start_evt.record()
             wall_prefill_start = time.perf_counter()  # Wall时间起点
+        if self.enable_mm_timing and is_decode_phase:
+            decode_start_evt = torch.npu.Event(enable_timing=True)
+            decode_stop_evt = torch.npu.Event(enable_timing=True)
+            decode_start_evt.record()
         do_prefill_timing = self.enable_ttft and is_prefill_phase
         if do_prefill_timing:
             evt_pf_s = torch.npu.Event(enable_timing=True)
@@ -1887,6 +1937,16 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     continue
                 step_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 rec["prefill_ms"] += pf_device_ms * (step_tokens / total_step_tokens)
+        if self.enable_mm_timing and is_decode_phase:
+            torch.npu.synchronize()
+            decode_stop_evt.record()
+            device_ms = decode_start_evt.elapsed_time(decode_stop_evt)
+            phase_name = "Decode"
+            if self.enable_mm_timing:
+                logger.info(
+                    f"[LLM]{phase_name} Step Time: device={device_ms:.3f} "
+                    f"(step_tokens={scheduler_output.total_num_scheduled_tokens}, batch_reqs={len(self.input_batch.req_ids)})"
+                )
         if (self.enable_mm_timing or self.enable_chunk_prefill_timing) and is_prefill_phase:
             prefill_end_evt.record()
             torch.npu.synchronize()
@@ -2120,6 +2180,20 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         )
                         # 如果不需要后续再引用，可释放：
                         # del self._ttft_reqs[req_id]
+            if self.enable_mm_mem:
+                for bs, s in sorted(self._mm_mem_stats.items(), key=lambda x: x[0]):
+                    avg_delta = s["delta_MB_total"] / max(1, s["count"])
+                    avg_time = s["time_ms_total"] / max(1, s["count"])
+                    logger.info(
+                        "[MM-MEM-AGG] group_items=%d count=%d avg_delta=%.2fMB "
+                        "peak_max=%.2fMB last_after=%.2fMB avg_time=%.2fms",
+                        bs,
+                        s["count"],
+                        avg_delta,
+                        s["peak_MB_max"],
+                        s["alloc_after_MB_last"],
+                        avg_time,
+                    )
 
         extra_args = ({"kv_connector_output": kv_connector_output})
 
