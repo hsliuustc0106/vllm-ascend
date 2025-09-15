@@ -450,6 +450,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     "first_token_emitted": False,
                     "prompt_tokens": len(new_req_data.prompt_token_ids),
                     "waiting_ts": None,
+                    "schedule_ts": new_req_data.schedule_ts,
+                    "first_arrival_ts": new_req_data.first_arrival_ts
                 }
             if sampling_params and \
                 sampling_params.sampling_type == SamplingType.RANDOM_SEED:
@@ -2107,13 +2109,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         comp_sum = rec["encoder_ms"] + rec["prefill_ms"]
                         logger.info(
                             "[TTFT][req=%s] encoder_ms=%.3f prefill_ms=%.3f (encoder+prefill)=%.3f "
-                            "ttft_total=%.3f prompt_tokens=%d",
+                            "ttft_total=%.3f prompt_tokens=%d queue_wait_ms=%.3f",
                             req_id,
                             rec["encoder_ms"],
                             rec["prefill_ms"],
                             comp_sum,
                             ttft_total_ms,
                             rec["prompt_tokens"],
+                            rec["schedule_ts"] - rec["first_arrival_ts"],
                         )
                         # 如果不需要后续再引用，可释放：
                         # del self._ttft_reqs[req_id]

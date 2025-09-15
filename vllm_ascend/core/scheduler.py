@@ -85,6 +85,11 @@ class AscendScheduler(Scheduler):
         # and put back at the head of the waiting queue later
         skipped_waiting_requests: deque[Request] = deque()
 
+        for req in self.waiting:
+            if getattr(req, "first_arrival_ts", None) is None:
+                # 记录首个到达时间
+                setattr(req, "first_arrival_ts", time.perf_counter())
+
         # Schedule prefill requests first.
         while self.waiting and token_budget > 0:
             if len(self.running) == self.max_num_running_reqs:
@@ -220,6 +225,8 @@ class AscendScheduler(Scheduler):
             # Check request status.
             if request.status == RequestStatus.WAITING:
                 scheduled_new_reqs.append(request)
+                if getattr(request, "schedule_ts", None) is None:
+                    setattr(request, "schedule_ts", time.perf_counter())
             elif request.status == RequestStatus.PREEMPTED:
                 scheduled_resumed_reqs.append(request)
             else:
