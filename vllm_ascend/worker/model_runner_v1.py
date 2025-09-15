@@ -61,9 +61,8 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
 from vllm.v1.core.encoder_cache_manager import compute_encoder_budget
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
-from vllm.v1.outputs import (ECConnectorOutput, EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
+from vllm.v1.outputs import (ECConnectorOutput, EMPTY_MODEL_RUNNER_OUTPUT,
                              ModelRunnerOutput, make_empty_encoder_model_runner_output)
-from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -516,6 +515,11 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                     )
 
             req_ids_to_add.append(req_id)
+
+        # If this rank is an EC transfer producer,
+        # skip updating the states of KV cache blocks.
+        if has_ec_transfer() and get_ec_transfer().is_producer:
+            return
 
         # Update the states of the running/resumed requests.
         for req_data in scheduler_output.scheduled_cached_reqs:
@@ -1388,61 +1392,6 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 hidden_states, attn_metadata)
         return spec_token_ids
 
-    def _pool(
-        self,
-        hidden_states: torch.Tensor,
-        num_scheduled_tokens: int,
-        num_scheduled_tokens_np: np.ndarray,
-        finished_sending: Optional[set[str]] = None,
-        finished_recving: Optional[set[str]] = None,
-        kv_connector_output: Optional["KVConnectorOutput"] = None,
-        ec_connector_output: Optional["ECConnectorOutput"] = None,
-    ) -> ModelRunnerOutput:
-        assert self.input_batch.num_reqs ==\
-            len(self.input_batch.pooling_params), \
-        "Either all or none of the requests in" \
-        " a batch must be pooling request"
-
-        extracted_hidden_states = list(
-            torch.split(hidden_states[:num_scheduled_tokens],
-                        num_scheduled_tokens_np.tolist()))
-
-        pooling_metadata = self.input_batch.pooling_metadata
-
-        raw_pooler_output = self.model.pooler(
-            hidden_states=extracted_hidden_states,
-            pooling_metadata=pooling_metadata)
-
-        pooler_output: list[Optional[torch.Tensor]] = []
-        seq_lens = self.seq_lens[:self.input_batch.num_reqs]
-        for raw_output, seq_len, prompt_len in zip(
-                raw_pooler_output, seq_lens, pooling_metadata.prompt_lens):
-
-            if seq_len == prompt_len:
-                pooler_output.append(raw_output.data.cpu())
-            else:
-                pooler_output.append(None)
-        extra_args = ({
-            "finished_sending": finished_sending,
-            "finished_recving": finished_recving
-        } if vllm_version_is("0.10.0") else {
-            "kv_connector_output": kv_connector_output
-        })
-        if self.is_multimodal_model and ec_connector_output is not None:
-            extra_args.update({
-                "ec_connector_output": ec_connector_output
-            })
-        return ModelRunnerOutput(
-            req_ids=self.input_batch.req_ids,
-            req_id_to_index=self.input_batch.req_id_to_index,
-            sampled_token_ids=[],
-            spec_token_ids=None,
-            logprobs=None,
-            prompt_logprobs_dict={},
-            pooler_output=pooler_output,
-            **extra_args,
-        )
-
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1481,44 +1430,8 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
                 self.eplb_updator.take_update_info_from_eplb_process()
 
         with ProfileExecuteDuration().capture_async("post process"):
-            # Broadcast PP output for external_launcher (torchrun)
-            # to make sure we are synced across pp ranks
-            # TODO: Support overlapping mirco-batches
-            # https://github.com/vllm-project/vllm/issues/18019
-            broadcast_pp_output = \
-                self.parallel_config.distributed_executor_backend \
-                == "external_launcher" and len(get_pp_group().ranks) > 0
-            if not get_pp_group().is_last_rank:
-                # For mid-pipeline stages, return the hidden states.
-                if not broadcast_pp_output:
-                    if kv_connector_output is not None:
-                        hidden_states.kv_connector_output = kv_connector_output
-                    else:
-                        #TODO: Remove this after we drop vllm v0.10.0
-                        hidden_states.finished_sending = finished_sending
-                        hidden_states.finished_recving = finished_recving
-                    return hidden_states
-                assert isinstance(hidden_states, IntermediateTensors)
-                get_pp_group().send_tensor_dict(
-                    hidden_states.tensors, all_gather_group=get_tp_group())
-                logits = None
-            else:
-                if self.input_batch.pooling_params:
-                    return self._pool(hidden_states, num_scheduled_tokens,
-                                      num_scheduled_tokens_np,
-                                      finished_sending, finished_recving,
-                                      kv_connector_output, ec_connector_output)
-                sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states, None)
-            if broadcast_pp_output:
-                model_output_broadcast_data = {
-                    "logits": logits.contiguous(),
-                } if logits is not None else {}
-                model_output_broadcast_data = get_pp_group(
-                ).broadcast_tensor_dict(model_output_broadcast_data,
-                                        src=len(get_pp_group().ranks) - 1)
-                assert model_output_broadcast_data is not None
-                logits = model_output_broadcast_data["logits"]
+            logits = self.model.compute_logits(hidden_states[sample_indices],
+                                               None)
 
             # Apply structured output bitmasks if present
             if scheduler_output.grammar_bitmask is not None:
