@@ -520,6 +520,11 @@ class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
             req_ids_to_add.append(req_id)
 
+        # If this rank is an EC transfer producer,
+        # skip updating the states of KV cache blocks.
+        if has_ec_transfer() and get_ec_transfer().is_producer:
+            return
+
         # Update the states of the running/resumed requests.
         req_data = scheduler_output.scheduled_cached_reqs
         is_last_rank = get_pp_group().is_last_rank
