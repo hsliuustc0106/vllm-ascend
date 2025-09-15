@@ -38,6 +38,8 @@ from vllm.attention import AttentionType, get_attn_backend
 from vllm.attention.layer import Attention
 from vllm.config import CompilationLevel, VllmConfig
 from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed.ec_transfer import (get_ec_transfer,
+                                          has_ec_transfer)
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
                                           has_kv_transfer_group)
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
@@ -60,8 +62,8 @@ from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
                         LazyLoader, cdiv)
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,
                                         KVCacheSpec)
-from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
-                             ModelRunnerOutput)
+from vllm.v1.outputs import (ECConnectorOutput, EMPTY_MODEL_RUNNER_OUTPUT, LogprobsTensors,
+                             ModelRunnerOutput, make_empty_encoder_model_runner_output)
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -70,6 +72,7 @@ from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.utils import (bind_kv_cache, gather_mm_placeholders,
                                   sanity_check_mm_encoder_outputs,
                                   scatter_mm_placeholders)
+from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 
 from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
@@ -149,7 +152,7 @@ def graph_capture(device: torch.device):
         yield graph_capture_context
 
 
-class NPUModelRunner(LoRAModelRunnerMixin):
+class NPUModelRunner(LoRAModelRunnerMixin, ECConnectorModelRunnerMixin):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
@@ -516,6 +519,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     )
 
             req_ids_to_add.append(req_id)
+
+        # If this rank is an EC transfer producer,
+        # skip updating the states of KV cache blocks.
+        if has_ec_transfer() and get_ec_transfer().is_producer:
+            return
 
         # Update the states of the running/resumed requests.
         req_data = scheduler_output.scheduled_cached_reqs
@@ -970,6 +978,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 output,
                 is_embed=pos_info.is_embed,
             )
+            self.maybe_save_ec_to_connector(self.encoder_cache,
+                                                request_id=req_id,
+                                                input_id=input_id)
 
     def _gather_mm_embeddings(
         self,
@@ -1216,9 +1227,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
         if self.is_multimodal_model:
-            # Run the multimodal encoder if any.
-            self._execute_mm_encoder(scheduler_output)
-            mm_embeds = self._gather_mm_embeddings(scheduler_output)
+            with self.maybe_get_ec_connector_output(
+                    scheduler_output,
+                    encoder_cache=self.encoder_cache,
+            ) as ec_connector_output:
+                # Run the multimodal encoder if any.
+                self._execute_mm_encoder(scheduler_output)
+                mm_embeds = self._gather_mm_embeddings(scheduler_output)
         else:
             mm_embeds = []
 
@@ -1538,6 +1553,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         finished_sending: Optional[set[str]] = None,
         finished_recving: Optional[set[str]] = None,
         kv_connector_output: Optional["KVConnectorOutput"] = None,
+        ec_connector_output: Optional["ECConnectorOutput"] = None,
     ) -> ModelRunnerOutput:
         assert self.input_batch.num_reqs ==\
             len(self.input_batch.pooling_params), \
@@ -1569,7 +1585,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         } if vllm_version_is("0.10.0") else {
             "kv_connector_output": kv_connector_output
         })
-
+        if self.is_multimodal_model and ec_connector_output is not None:
+            extra_args.update({
+                "ec_connector_output": ec_connector_output
+            })
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
@@ -1590,6 +1609,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         with ProfileExecuteDuration().capture_async(
                 "prepare input and forward"):
             self._update_states(scheduler_output)
+            if has_ec_transfer() and get_ec_transfer().is_producer:
+                with self.maybe_get_ec_connector_output(
+                        scheduler_output,
+                        encoder_cache=self.encoder_cache,
+                ) as ec_connector_output:
+                    self._execute_mm_encoder(scheduler_output)
+                    return make_empty_encoder_model_runner_output(scheduler_output)
+
             if not scheduler_output.total_num_scheduled_tokens:
                 if not has_kv_transfer_group():
                     logger.debug(
@@ -1637,7 +1664,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     return self._pool(hidden_states, num_scheduled_tokens,
                                       num_scheduled_tokens_np,
                                       finished_sending, finished_recving,
-                                      kv_connector_output)
+                                      kv_connector_output, ec_connector_output)
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states, None)
             if broadcast_pp_output:
@@ -2341,6 +2368,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             format. Layers that do not need KV cache are not included.
         """
 
+        if has_ec_transfer() and get_ec_transfer().is_producer:
+            return {}
         forward_ctx = self.vllm_config.compilation_config.static_forward_context
         use_mla = self.vllm_config.model_config.use_mla
         kv_cache_spec: dict[str, KVCacheSpec] = {}
