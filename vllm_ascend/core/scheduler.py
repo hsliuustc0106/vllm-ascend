@@ -395,6 +395,14 @@ class AscendScheduler(Scheduler):
                 num_scheduled_tokens, scheduled_spec_decode_tokens,
                 req_to_new_blocks)
         scheduled_cached_reqs = cached_reqs_data
+        
+        if self.enable_ttft:
+            for nd in new_reqs_data:
+                req = self.requests[nd.req_id]
+                if getattr(req, "schedule_ts", None) is not None:
+                    setattr(nd, "schedule_ts", req.schedule_ts)
+                if getattr(req, "first_arrival_ts", None) is not None:
+                    setattr(nd, "arrival_ts", req.first_arrival_ts)
 
         if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
             scheduler_output = SchedulerOutput(
