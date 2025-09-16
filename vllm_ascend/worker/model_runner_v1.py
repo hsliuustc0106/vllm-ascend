@@ -2195,17 +2195,17 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         logger.info(
                             "[TTFT][req=%s] "
                             "queue_wait_ms=%.5f update_states_ms=%.3f prepare_inputs_ms=%.3f "
-                            "encoder_ms=%.3f prefill_ms=%.3f ttft_total=%.3f"
-                            "prompt_tokens=%d",
+                            "prefill_ms=%.3f ttft_total=%.3f"
+                            "encoder_ms=%.3f prompt_tokens=%d",
                             req_id,
                             (rec["schedule_ts"] - rec["first_arrival_ts"]) if (
                                 rec.get('schedule_ts') is not None and rec.get('first_arrival_ts') is not None
                             ) else -1.0,
                             per_req_update_ms,
                             per_req_prepare_ms,
-                            rec["encoder_ms"],
                             rec["prefill_ms"],
                             ttft_total_ms,
+                            rec["encoder_ms"],
                             rec["prompt_tokens"],
                         )
             if self.enable_mm_mem:
