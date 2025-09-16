@@ -233,6 +233,9 @@ class AscendScheduler(Scheduler):
                         setattr(request, "schedule_ts", time.perf_counter())
             elif request.status == RequestStatus.PREEMPTED:
                 scheduled_resumed_reqs.append(request)
+                if self.enable_ttft:
+                    if getattr(request, "schedule_ts", None) is None:
+                        setattr(request, "schedule_ts", time.perf_counter())
             else:
                 raise RuntimeError(f"Invalid request status: {request.status}")
 
@@ -330,6 +333,9 @@ class AscendScheduler(Scheduler):
 
                 # Schedule the request.
                 scheduled_running_reqs.append(request)
+                if self.enable_ttft:
+                    if getattr(request, "schedule_ts", None) is None:
+                        setattr(request, "schedule_ts", time.perf_counter())
                 self.scheduled_req_ids.add(request.request_id)
                 if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
                     req_to_new_block_ids[request.request_id] = (
@@ -395,7 +401,7 @@ class AscendScheduler(Scheduler):
                 num_scheduled_tokens, scheduled_spec_decode_tokens,
                 req_to_new_blocks)
         scheduled_cached_reqs = cached_reqs_data
-        
+
         if self.enable_ttft:
             for nd in new_reqs_data:
                 req = self.requests[nd.req_id]
