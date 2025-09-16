@@ -1849,8 +1849,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, torch.Tensor]:
+        update_states_ms, prepare_inputs_ms = 0.0, 0.0
         with ProfileExecuteDuration().capture_async("prepare input"):
+            t_upd_start = time.perf_counter()
             self._update_states(scheduler_output)
+            t_upd_end = time.perf_counter()
+            update_states_ms = (t_upd_end - t_upd_start) * 1000.0
             if not scheduler_output.total_num_scheduled_tokens:
                 if not has_kv_transfer_group():
                     logger.debug(
@@ -1859,11 +1863,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     # Return empty ModelRunnerOuptut if there's no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 return self.kv_connector_no_forward(scheduler_output)
+            t_prep_start = time.perf_counter()
             (attn_metadata, positions, num_scheduled_tokens_np,
              num_input_tokens, num_tokens_across_dp, maybe_padded_num_tokens,
              logits_indices, spec_decode_metadata, input_ids, inputs_embeds,
              intermediate_tensors) = (self._prepare_inputs(
                  scheduler_output, intermediate_tensors))
+            t_prep_end = time.perf_counter()
+            prepare_inputs_ms = (t_prep_end - t_prep_start) * 1000.0
 
         moe_comm_method = self._select_moe_comm_method(num_input_tokens)
 
@@ -1938,8 +1945,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 step_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 rec["prefill_ms"] += pf_device_ms * (step_tokens / total_step_tokens)
         if self.enable_mm_timing and is_decode_phase:
-            torch.npu.synchronize()
             decode_stop_evt.record()
+            torch.npu.synchronize()
             device_ms = decode_start_evt.elapsed_time(decode_stop_evt)
             phase_name = "Decode"
             if self.enable_mm_timing:
@@ -2167,19 +2174,40 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         first_token_ts = time.perf_counter()
                         ttft_total_ms = (first_token_ts - rec["submit_ts"]) * 1000.0
                         comp_sum = rec["encoder_ms"] + rec["prefill_ms"]
-                        logger.info(
-                            "[TTFT][req=%s] encoder_ms=%.3f prefill_ms=%.3f (encoder+prefill)=%.3f "
-                            "ttft_total=%.3f prompt_tokens=%d queue_wait_ms=%.5f",
-                            req_id,
-                            rec["encoder_ms"],
-                            rec["prefill_ms"],
-                            comp_sum,
-                            ttft_total_ms,
-                            rec["prompt_tokens"],
-                            rec["schedule_ts"] - rec["first_arrival_ts"],
-                        )
+                        # logger.info(
+                        #     "[TTFT][req=%s] encoder_ms=%.3f prefill_ms=%.3f (encoder+prefill)=%.3f "
+                        #     "ttft_total=%.3f prompt_tokens=%d queue_wait_ms=%.5f",
+                        #     req_id,
+                        #     rec["encoder_ms"],
+                        #     rec["prefill_ms"],
+                        #     comp_sum,
+                        #     ttft_total_ms,
+                        #     rec["prompt_tokens"],
+                        #     rec["schedule_ts"] - rec["first_arrival_ts"],
+                        # )
                         # 如果不需要后续再引用，可释放：
                         # del self._ttft_reqs[req_id]
+                        # 将批级 update_states / prepare_inputs / decode_phase 分摊给此批每个 req
+                        req_cnt = max(1, len(self.input_batch.req_ids))
+                        per_req_update_ms = update_states_ms / req_cnt
+                        per_req_prepare_ms = prepare_inputs_ms / req_cnt
+
+                        logger.info(
+                            "[TTFT][req=%s] "
+                            "queue_wait_ms=%.5f update_ms=%.3f prepare_ms=%.3f "
+                            "encoder_ms=%.3f prefill_ms=%.3f ttft_total=%.3f"
+                            "prompt_tokens=%d",
+                            req_id,
+                            (rec["schedule_ts"] - rec["first_arrival_ts"]) if (
+                                rec.get('schedule_ts') is not None and rec.get('first_arrival_ts') is not None
+                            ) else -1.0,
+                            per_req_update_ms,
+                            per_req_prepare_ms,
+                            rec["encoder_ms"],
+                            rec["prefill_ms"],
+                            ttft_total_ms,
+                            rec["prompt_tokens"],
+                        )
             if self.enable_mm_mem:
                 for bs, s in sorted(self._mm_mem_stats.items(), key=lambda x: x[0]):
                     avg_delta = s["delta_MB_total"] / max(1, s["count"])
