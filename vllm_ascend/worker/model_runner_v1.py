@@ -1878,7 +1878,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             AscendAttentionState.ChunkedPrefill,
             AscendAttentionState.PrefillCacheHit,
         )
-        is_decode_phase = self.attn_state in (AscendAttentionState.DecodeOnly) # decode阶段
+        is_decode_phase = self.attn_state == AscendAttentionState.DecodeOnly # decode阶段
         is_chunked_prefill = (self.attn_state == AscendAttentionState.ChunkedPrefill)  # 专门标记Chunked Prefill
         if (self.enable_mm_timing or self.enable_chunk_prefill_timing) and is_prefill_phase:
             prefill_start_evt = torch.npu.Event(enable_timing=True)  # prefill开始
@@ -2169,7 +2169,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         comp_sum = rec["encoder_ms"] + rec["prefill_ms"]
                         logger.info(
                             "[TTFT][req=%s] encoder_ms=%.3f prefill_ms=%.3f (encoder+prefill)=%.3f "
-                            "ttft_total=%.3f prompt_tokens=%d queue_wait_ms=%.3f",
+                            "ttft_total=%.3f prompt_tokens=%d queue_wait_ms=%.5f",
                             req_id,
                             rec["encoder_ms"],
                             rec["prefill_ms"],
