@@ -2194,7 +2194,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
                         logger.info(
                             "[TTFT][req=%s] "
-                            "queue_wait_ms=%.5f update_ms=%.3f prepare_ms=%.3f "
+                            "queue_wait_ms=%.5f update_states_ms=%.3f prepare_inputs_ms=%.3f "
                             "encoder_ms=%.3f prefill_ms=%.3f ttft_total=%.3f"
                             "prompt_tokens=%d",
                             req_id,
