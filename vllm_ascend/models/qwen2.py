@@ -230,7 +230,8 @@ class CustomQwen2Model(Qwen2Model):
                          prefix=prefix,
                          decoder_layer_type=decoder_layer_type)
         self.tp_size = get_tensor_model_parallel_world_size()
-        self.cos_sin_cache = self.layers[0].self_attn.rotary_emb.cos_sin_cache
+        if self.layers is not None:
+            self.cos_sin_cache = self.layers[0].self_attn.rotary_emb.cos_sin_cache
 
     def forward(
         self,
