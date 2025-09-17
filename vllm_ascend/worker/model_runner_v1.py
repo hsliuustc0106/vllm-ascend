@@ -1013,7 +1013,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             if do_mem:
                 # 第一个 group （或者每个 group 前）可选择是否 reset 峰值
                 # 如果想每个 group 独立峰值：重置放这里；如果想整次 encoder 看一个峰值，就放在循环外。
-                # 这里选择“每个 group 单独统计”：
                 mem_before = torch.npu.memory_allocated()
 
             curr_group_outputs = self.model.get_multimodal_embeddings(
@@ -1065,7 +1064,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 # 如果需要精确，可在上面构造分组时建立映射。
                 for req_id in ttft_need_reqs:
                     # 如果你有更精细的统计(比如req在此group里实际图像数)可以替换为真实值
-                    self._ttft_reqs[req_id]["encoder_ms"] += per_item * 1  # 这里假设每个req贡献1个item
+                    self._ttft_reqs[req_id]["encoder_ms"] += per_item * num_items  # 这里假设每个req贡献1个item
                 # 可选：如果确定所有编码都一次完成，可标记 encoder_done=True
                 # 不强制设置，保持累加逻辑
             sanity_check_mm_encoder_outputs(
