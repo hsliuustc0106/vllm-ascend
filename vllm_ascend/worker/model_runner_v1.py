@@ -379,13 +379,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # 结构:
         # {
         #   req_id: {
-        #       "submit_ts": float,            # 请求加入(第一次调度)时间
+        #       "submitModel_ts": float,       # 请求加入Model时间
         #       "encoder_ms": 0.0,             # 累计图片编码设备时间(按均分或权重分配)
         #       "prefill_ms": 0.0,             # 累计LLM prefill设备时间(按token比例分摊)
         #       "encoder_done": bool,          # 是否已编码（多图就看是否本次全处理）
         #       "first_token_emitted": False,  # 是否已产出第一个token
         #       "prompt_tokens": int,          # prompt长度(含多模态嵌入后的token数)
-        #       "waiting_ts": None,            # 如果要算排队端到端TTFT，可用 submit_ts -> first_token_ts
+        #       "waiting_ts": None,            # 如果要算排队端到端TTFT，可用 submitModel_ts -> first_token_ts
+        #       "schedule_ts": int,            # 第一次被调度的时间
+        #       "first_arrival_ts": int,       # 请求到达调度器的时间
         #   }, ...
         # }
         self._chunked_prefill_accumulator = {}  # 存储每个请求的Chunked Prefill累积数据
@@ -451,7 +453,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             if self.enable_ttft:
                 # 第一次见到该请求，记录提交时间
                 self._ttft_reqs[req_id] = {
-                    "submit_ts": time.perf_counter(),
+                    "submitModel_ts": time.perf_counter(),
                     "encoder_ms": 0.0,
                     "prefill_ms": 0.0,
                     "encoder_done": False,
@@ -972,9 +974,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # multimodal inputs. The proper solution should be reordering the
         # encoder outputs.
         encoder_outputs = []
-         # 图像编码计时（批内合计）
-        if self.enable_mm_timing:
-            cpu_pre_time_start = time.perf_counter()
+        # 图像编码计时（批内合计）
+        # if self.enable_mm_timing:
+        #     cpu_pre_time_start = time.perf_counter()
 
         grouped_info = list(group_mm_kwargs_by_modality(
             mm_kwargs,
@@ -1074,13 +1076,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             for output in curr_group_outputs:
                 encoder_outputs.append(output)
         
-        if self.enable_mm_timing:
-            cpu_pre_time_end = time.perf_counter()
-            logger.info(
-                "[MM] Image Pre+Batch Build Time (host) = "
-                f"{(cpu_pre_time_mid - cpu_pre_time_start)*1000:.3f} ms ; "
-                f"ScatterTime+Loop (host) = {(cpu_pre_time_end - cpu_pre_time_mid)*1000:.3f} ms"
-            )
+        # if self.enable_mm_timing:
+        #     cpu_pre_time_end = time.perf_counter()
+        #     logger.info(
+        #         "[MM] Image Pre+Batch Build Time (host) = "
+        #         f"{(cpu_pre_time_mid - cpu_pre_time_start)*1000:.3f} ms ; "
+        #         f"ScatterTime+Loop (host) = {(cpu_pre_time_end - cpu_pre_time_mid)*1000:.3f} ms"
+        #     )
         if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
             # Cache the encoder outputs.
             for (req_id, input_id, pos_info), output in zip(
@@ -1851,10 +1853,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
     ) -> Union[ModelRunnerOutput, torch.Tensor]:
         update_states_ms, prepare_inputs_ms = 0.0, 0.0
         with ProfileExecuteDuration().capture_async("prepare input"):
-            t_upd_start = time.perf_counter()
+            if self.enable_ttft:
+                t_upd_start = time.perf_counter()
             self._update_states(scheduler_output)
-            t_upd_end = time.perf_counter()
-            update_states_ms = (t_upd_end - t_upd_start) * 1000.0
+            if self.enable_ttft:
+                t_upd_end = time.perf_counter()
+                update_states_ms = (t_upd_end - t_upd_start) * 1000.0
             if not scheduler_output.total_num_scheduled_tokens:
                 if not has_kv_transfer_group():
                     logger.debug(
@@ -1863,14 +1867,16 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     # Return empty ModelRunnerOuptut if there's no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 return self.kv_connector_no_forward(scheduler_output)
-            t_prep_start = time.perf_counter()
+            if self.enable_ttft:
+                t_prep_start = time.perf_counter()
             (attn_metadata, positions, num_scheduled_tokens_np,
              num_input_tokens, num_tokens_across_dp, maybe_padded_num_tokens,
              logits_indices, spec_decode_metadata, input_ids, inputs_embeds,
              intermediate_tensors) = (self._prepare_inputs(
                  scheduler_output, intermediate_tensors))
-            t_prep_end = time.perf_counter()
-            prepare_inputs_ms = (t_prep_end - t_prep_start) * 1000.0
+            if self.enable_ttft:
+                t_prep_end = time.perf_counter()
+                prepare_inputs_ms = (t_prep_end - t_prep_start) * 1000.0
 
         moe_comm_method = self._select_moe_comm_method(num_input_tokens)
 
@@ -1988,6 +1994,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             kv_connector_output = None
         finished_sending = None
         finished_recving = None
+        if self.enable_ttft:
+            t_postprocess_start = time.perf_counter()
         with ProfileExecuteDuration().capture_async("post process"):
             # Broadcast PP output for external_launcher (torchrun)
             # to make sure we are synced across pp ranks
@@ -2157,6 +2165,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
             if has_kv_transfer_group():
                 get_kv_transfer_group().clear_connector_metadata()
+            if self.enable_ttft:
+                t_postprocess_end = time.perf_counter()
+                postprocess_ms = (t_postprocess_end - t_postprocess_start) * 1000.0
             # ---------------- TTFT 首 token 产出判定与日志输出（新增）----------------
             # 条件：
             # 1) 已开启 TTFT 开关 (self.enable_ttft)
@@ -2172,7 +2183,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     if req_state.num_computed_tokens == 0 and valid_sampled_token_ids[i]:
                         rec["first_token_emitted"] = True
                         first_token_ts = time.perf_counter()
-                        ttft_total_ms = (first_token_ts - rec["submit_ts"]) * 1000.0
+                        ttft_total_ms = (first_token_ts - rec["first_arrival_ts"]) * 1000.0
                         comp_sum = rec["encoder_ms"] + rec["prefill_ms"]
                         # logger.info(
                         #     "[TTFT][req=%s] encoder_ms=%.3f prefill_ms=%.3f (encoder+prefill)=%.3f "
@@ -2191,11 +2202,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         req_cnt = max(1, len(self.input_batch.req_ids))
                         per_req_update_ms = update_states_ms / req_cnt
                         per_req_prepare_ms = prepare_inputs_ms / req_cnt
+                        postprocess_ms = postprocess_ms / req_cnt
 
                         logger.info(
                             "[TTFT][req=%s] "
                             "queue_wait_ms=%.5f update_states_ms=%.3f prepare_inputs_ms=%.3f "
-                            "prefill_ms=%.3f ttft_total=%.3f"
+                            "prefill_ms=%.3f postprocess_ms=%.3f ttft_total=%.3f "
                             "encoder_ms=%.3f prompt_tokens=%d",
                             req_id,
                             (rec["schedule_ts"] - rec["first_arrival_ts"]) if (
@@ -2204,6 +2216,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             per_req_update_ms,
                             per_req_prepare_ms,
                             rec["prefill_ms"],
+                            postprocess_ms,
                             ttft_total_ms,
                             rec["encoder_ms"],
                             rec["prompt_tokens"],
