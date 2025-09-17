@@ -2224,16 +2224,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             if self.enable_mm_mem:
                 for bs, s in sorted(self._mm_mem_stats.items(), key=lambda x: x[0]):
                     avg_delta = s["delta_MB_total"] / max(1, s["count"])
-                    avg_time = s["time_ms_total"] / max(1, s["count"])
                     logger.info(
                         "[MM-MEM-AGG] group_items=%d count=%d avg_delta=%.2fMB "
-                        "peak_max=%.2fMB last_after=%.2fMB avg_time=%.2fms",
+                        "delta_MB_total=%.2fMB",
                         bs,
                         s["count"],
                         avg_delta,
-                        s["peak_MB_max"],
-                        s["alloc_after_MB_last"],
-                        avg_time,
+                        s["delta_MB_total"],
                     )
 
         extra_args = ({"kv_connector_output": kv_connector_output})
