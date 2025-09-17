@@ -1056,14 +1056,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 torch.npu.synchronize()
                 wall_e = time.perf_counter()
                 group_device_ms = evt_s.elapsed_time(evt_e)
-                # 简单按 item 均分到所有“本次真正参与编码的请求”
-                # 如果一个 req 多张图被拆成多次 group，可多次累加
-                per_item = group_device_ms / max(1, num_items)
-                # 遍历 scheduled_encoder_inputs 决定哪些 req 属于这个 group
-                # 简化：我们不再精确匹配 items->req，默认这 group 中所有 still-needed req 平均加 per_item * (其本组图像数)
-                # 如果需要精确，可在上面构造分组时建立映射。
                 for req_id in ttft_need_reqs:
-                    self._ttft_reqs[req_id]["encoder_ms"] += per_item * num_items
+                    self._ttft_reqs[req_id]["encoder_ms"] += group_device_ms
             sanity_check_mm_encoder_outputs(
                 curr_group_outputs,
                 expected_num_items=num_items,
@@ -1945,7 +1939,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 if not rec or rec["first_token_emitted"]:
                     continue
                 step_tokens = scheduler_output.num_scheduled_tokens[req_id]
-                rec["prefill_ms"] += pf_device_ms * (step_tokens / total_step_tokens)
+                rec["prefill_ms"] += pf_device_ms
         if self.enable_mm_timing and is_decode_phase:
             decode_stop_evt.record()
             torch.npu.synchronize()
@@ -2198,7 +2192,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         req_cnt = max(1, len(self.input_batch.req_ids))
                         per_req_update_ms = update_states_ms / req_cnt
                         per_req_prepare_ms = prepare_inputs_ms / req_cnt
-                        postprocess_ms = postprocess_ms / req_cnt
 
                         logger.info(
                             "[TTFT][req=%s] "
