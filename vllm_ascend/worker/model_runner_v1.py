@@ -1994,6 +1994,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             broadcast_pp_output = \
                 self.parallel_config.distributed_executor_backend \
                 == "external_launcher" and len(get_pp_group().ranks) > 0
+            if self.enable_ttft:
+                t_broadcast_start = time.perf_counter()
             if not get_pp_group().is_last_rank:
                 # For mid-pipeline stages, return the hidden states.
                 if not broadcast_pp_output:
@@ -2020,6 +2022,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             finished_recving, kv_connector_output)
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states, None)
+            if self.enable_ttft:
+                t_models_end = time.perf_counter()
+                model_ms = (t_models_end - t_broadcast_start) * 1000.0
             if broadcast_pp_output:
                 model_output_broadcast_data = {
                     "logits": logits.contiguous(),
@@ -2035,6 +2040,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 logits = self.apply_grammar_bitmask(scheduler_output, logits)
 
             # Sample the next token and get logprobs if needed.
+            if self.enable_ttft:
+                t_sampling_start = time.perf_counter()
             sampling_metadata = self.input_batch.sampling_metadata
             if spec_decode_metadata is None:
                 if lmhead_tp_enable() and logits is not None:
@@ -2072,7 +2079,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     sampling_metadata,
                 )
                 sampler_output.sampled_token_ids = output_token_ids
-
+            if self.enable_ttft:
+                t_sampling_end = time.perf_counter()
+                sampling_ms = (t_sampling_end - t_sampling_start) * 1000.0
             discard_sampled_tokens_req_indices: list[int] = []
             # TODO(woosuk): The following loop can be slow since it iterates over
             # the requests one by one. Optimize.
@@ -2174,38 +2183,21 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         rec["first_token_emitted"] = True
                         first_token_ts = time.perf_counter()
                         ttft_total_ms = (first_token_ts - rec["first_arrival_ts"]) * 1000.0
-                        comp_sum = rec["encoder_ms"] + rec["prefill_ms"]
-                        # logger.info(
-                        #     "[TTFT][req=%s] encoder_ms=%.3f prefill_ms=%.3f (encoder+prefill)=%.3f "
-                        #     "ttft_total=%.3f prompt_tokens=%d queue_wait_ms=%.5f",
-                        #     req_id,
-                        #     rec["encoder_ms"],
-                        #     rec["prefill_ms"],
-                        #     comp_sum,
-                        #     ttft_total_ms,
-                        #     rec["prompt_tokens"],
-                        #     rec["schedule_ts"] - rec["first_arrival_ts"],
-                        # )
-                        # 如果不需要后续再引用，可释放：
-                        # del self._ttft_reqs[req_id]
-                        # 将批级 update_states / prepare_inputs / decode_phase 分摊给此批每个 req
-                        req_cnt = max(1, len(self.input_batch.req_ids))
-                        per_req_update_ms = update_states_ms / req_cnt
-                        per_req_prepare_ms = prepare_inputs_ms / req_cnt
 
                         logger.info(
                             "[TTFT][req=%s] "
                             "queue_wait_ms=%.5f update_states_ms=%.3f prepare_inputs_ms=%.3f "
-                            "prefill_ms=%.3f postprocess_ms=%.3f ttft_total=%.3f "
+                            "prefill_ms=%.3f sampling_ms=%.3f model_ms=%.3f ttft_total=%.3f "
                             "encoder_ms=%.3f prompt_tokens=%d",
                             req_id,
                             (rec["schedule_ts"] - rec["first_arrival_ts"]) if (
                                 rec.get('schedule_ts') is not None and rec.get('first_arrival_ts') is not None
                             ) else -1.0,
-                            per_req_update_ms,
-                            per_req_prepare_ms,
+                            update_states_ms,
+                            prepare_inputs_ms,
                             rec["prefill_ms"],
-                            postprocess_ms,
+                            sampling_ms,
+                            model_ms,
                             ttft_total_ms,
                             rec["encoder_ms"],
                             rec["prompt_tokens"],
