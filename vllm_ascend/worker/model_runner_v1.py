@@ -1897,6 +1897,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             evt_pf_s = torch.npu.Event(enable_timing=True)
             evt_pf_e = torch.npu.Event(enable_timing=True)
             evt_pf_s.record()
+        if self.enable_ttft:
+            t_models_start = time.perf_counter()
         # Run forward pass
         with ProfileExecuteDuration().capture_async("forward"):
             with set_ascend_forward_context(
@@ -1924,6 +1926,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
+        if self.enable_ttft:
+            t_models_end = time.perf_counter()
+            models_ms = (t_models_end - t_models_start) * 1000.0
         if do_prefill_timing:
             evt_pf_e.record()
             torch.npu.synchronize()
@@ -1984,8 +1989,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             kv_connector_output = None
         finished_sending = None
         finished_recving = None
-        if self.enable_ttft:
-            t_postprocess_start = time.perf_counter()
         with ProfileExecuteDuration().capture_async("post process"):
             # Broadcast PP output for external_launcher (torchrun)
             # to make sure we are synced across pp ranks
@@ -1995,7 +1998,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 self.parallel_config.distributed_executor_backend \
                 == "external_launcher" and len(get_pp_group().ranks) > 0
             if self.enable_ttft:
-                t_broadcast_start = time.perf_counter()
+                t_compute_logits_start = time.perf_counter()
             if not get_pp_group().is_last_rank:
                 # For mid-pipeline stages, return the hidden states.
                 if not broadcast_pp_output:
@@ -2023,8 +2026,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states, None)
             if self.enable_ttft:
-                t_models_end = time.perf_counter()
-                model_ms = (t_models_end - t_broadcast_start) * 1000.0
+                t_compute_logits_end = time.perf_counter()
+                compute_logits_ms = (t_compute_logits_end - t_compute_logits_start) * 1000.0
             if broadcast_pp_output:
                 model_output_broadcast_data = {
                     "logits": logits.contiguous(),
@@ -2164,9 +2167,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
             if has_kv_transfer_group():
                 get_kv_transfer_group().clear_connector_metadata()
-            if self.enable_ttft:
-                t_postprocess_end = time.perf_counter()
-                postprocess_ms = (t_postprocess_end - t_postprocess_start) * 1000.0
             # ---------------- TTFT 首 token 产出判定与日志输出（新增）----------------
             # 条件：
             # 1) 已开启 TTFT 开关 (self.enable_ttft)
@@ -2187,8 +2187,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         logger.info(
                             "[TTFT][req=%s] "
                             "queue_wait_ms=%.5f update_states_ms=%.3f prepare_inputs_ms=%.3f "
-                            "prefill_ms=%.3f sampling_ms=%.3f model_ms=%.3f ttft_total=%.3f "
-                            "encoder_ms=%.3f prompt_tokens=%d",
+                            "prefill_ms=%.3f sampling_ms=%.3f models_ms=%.3f compute_logits_ms=%.3f "
+                            "ttft_total=%.3f encoder_ms=%.3f prompt_tokens=%d",
                             req_id,
                             (rec["schedule_ts"] - rec["first_arrival_ts"]) if (
                                 rec.get('schedule_ts') is not None and rec.get('first_arrival_ts') is not None
@@ -2197,7 +2197,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             prepare_inputs_ms,
                             rec["prefill_ms"],
                             sampling_ms,
-                            model_ms,
+                            models_ms,
+                            compute_logits_ms,
                             ttft_total_ms,
                             rec["encoder_ms"],
                             rec["prompt_tokens"],
