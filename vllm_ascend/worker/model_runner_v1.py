@@ -1847,6 +1847,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 t_upd_start = time.perf_counter()
             self._update_states(scheduler_output)
             if self.enable_ttft:
+                torch.npu.current_stream().synchronize()
                 t_upd_end = time.perf_counter()
                 update_states_ms = (t_upd_end - t_upd_start) * 1000.0
             if not scheduler_output.total_num_scheduled_tokens:
@@ -1865,6 +1866,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
              intermediate_tensors) = (self._prepare_inputs(
                  scheduler_output, intermediate_tensors))
             if self.enable_ttft:
+                torch.npu.current_stream().synchronize()
                 t_prep_end = time.perf_counter()
                 prepare_inputs_ms = (t_prep_end - t_prep_start) * 1000.0
 
@@ -1927,6 +1929,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
         if self.enable_ttft:
+            torch.npu.current_stream().synchronize()
             t_models_end = time.perf_counter()
             models_ms = (t_models_end - t_models_start) * 1000.0
         if do_prefill_timing:
@@ -2026,6 +2029,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states, None)
             if self.enable_ttft:
+                torch.npu.current_stream().synchronize()
                 t_compute_logits_end = time.perf_counter()
                 compute_logits_ms = (t_compute_logits_end - t_compute_logits_start) * 1000.0
             if broadcast_pp_output:
@@ -2083,8 +2087,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 )
                 sampler_output.sampled_token_ids = output_token_ids
             if self.enable_ttft:
+                torch.npu.current_stream().synchronize()
                 t_sampling_end = time.perf_counter()
                 sampling_ms = (t_sampling_end - t_sampling_start) * 1000.0
+            if self.enable_ttft:
+                t_post_process_start = time.perf_counter()
             discard_sampled_tokens_req_indices: list[int] = []
             # TODO(woosuk): The following loop can be slow since it iterates over
             # the requests one by one. Optimize.
@@ -2167,6 +2174,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
             if has_kv_transfer_group():
                 get_kv_transfer_group().clear_connector_metadata()
+            if self.enable_ttft:
+                torch.npu.current_stream().synchronize()
+                t_post_process_end = time.perf_counter()
+                post_process_ms = (t_post_process_end - t_post_process_start) * 1000.0
             # ---------------- TTFT 首 token 产出判定与日志输出（新增）----------------
             # 条件：
             # 1) 已开启 TTFT 开关 (self.enable_ttft)
@@ -2183,22 +2194,23 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         rec["first_token_emitted"] = True
                         first_token_ts = time.perf_counter()
                         ttft_total_ms = (first_token_ts - rec["first_arrival_ts"]) * 1000.0
-
+                        # prepare_inputs_ms 中已包含 encoder_ms，需剔除
+                        prepare_inputs_ms = prepare_inputs_ms - rec["encoder_ms"]
                         logger.info(
                             "[TTFT][req=%s] "
                             "queue_wait_ms=%.5f update_states_ms=%.3f prepare_inputs_ms=%.3f "
-                            "prefill_ms=%.3f sampling_ms=%.3f models_ms=%.3f compute_logits_ms=%.3f "
+                            "prefill_ms=%.3f sampling_ms=%.3f compute_logits_ms=%.3f post_process_ms=%.3f "
                             "ttft_total=%.3f encoder_ms=%.3f prompt_tokens=%d",
                             req_id,
-                            (rec["schedule_ts"] - rec["first_arrival_ts"]) if (
+                            (rec["submitModel_ts"] - rec["first_arrival_ts"]) * 1000.0 if (
                                 rec.get('schedule_ts') is not None and rec.get('first_arrival_ts') is not None
                             ) else -1.0,
                             update_states_ms,
                             prepare_inputs_ms,
                             rec["prefill_ms"],
                             sampling_ms,
-                            models_ms,
                             compute_logits_ms,
+                            post_process_ms,
                             ttft_total_ms,
                             rec["encoder_ms"],
                             rec["prompt_tokens"],
