@@ -14,7 +14,6 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-import os
 import time
 from collections import deque
 from typing import Iterable, Union
@@ -58,7 +57,6 @@ class AscendScheduler(Scheduler):
                          include_finished_set, log_stats)
         self.scheduled_req_ids: set[str] = set()
         self.running: list[Request] = []
-        self.enable_ttft = bool(int(os.environ.get("VLLM_ASCEND_TTFT", "0")))  # 仅统计 Encoder + Prefill 的 TTFT
 
     def schedule(self) -> SchedulerOutput:
         if self.scheduler_config.chunked_prefill_enabled:
@@ -86,12 +84,6 @@ class AscendScheduler(Scheduler):
         # Use a temporary deque to collect requests that need to be skipped
         # and put back at the head of the waiting queue later
         skipped_waiting_requests: deque[Request] = deque()
-
-        if self.enable_ttft:
-            for req in self.waiting:
-                if getattr(req, "first_arrival_ts", None) is None:
-                    # 记录首个到达时间
-                    setattr(req, "first_arrival_ts", time.perf_counter())
 
         # Schedule prefill requests first.
         while self.waiting and token_budget > 0:
@@ -228,14 +220,8 @@ class AscendScheduler(Scheduler):
             # Check request status.
             if request.status == RequestStatus.WAITING:
                 scheduled_new_reqs.append(request)
-                if self.enable_ttft:
-                    if getattr(request, "schedule_ts", None) is None:
-                        setattr(request, "schedule_ts", time.perf_counter())
             elif request.status == RequestStatus.PREEMPTED:
                 scheduled_resumed_reqs.append(request)
-                if self.enable_ttft:
-                    if getattr(request, "schedule_ts", None) is None:
-                        setattr(request, "schedule_ts", time.perf_counter())
             else:
                 raise RuntimeError(f"Invalid request status: {request.status}")
 
@@ -333,9 +319,6 @@ class AscendScheduler(Scheduler):
 
                 # Schedule the request.
                 scheduled_running_reqs.append(request)
-                if self.enable_ttft:
-                    if getattr(request, "schedule_ts", None) is None:
-                        setattr(request, "schedule_ts", time.perf_counter())
                 self.scheduled_req_ids.add(request.request_id)
                 if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
                     req_to_new_block_ids[request.request_id] = (
@@ -401,14 +384,6 @@ class AscendScheduler(Scheduler):
                 num_scheduled_tokens, scheduled_spec_decode_tokens,
                 req_to_new_blocks)
         scheduled_cached_reqs = cached_reqs_data
-
-        if self.enable_ttft:
-            for nd in new_reqs_data:
-                req = self.requests[nd.req_id]
-                if getattr(req, "schedule_ts", None) is not None:
-                    setattr(nd, "schedule_ts", req.schedule_ts)
-                if getattr(req, "first_arrival_ts", None) is not None:
-                    setattr(nd, "arrival_ts", req.first_arrival_ts)
 
         if vllm_version_is("0.10.1.1") or vllm_version_is("0.10.1"):
             scheduler_output = SchedulerOutput(
