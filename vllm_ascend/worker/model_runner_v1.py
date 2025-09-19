@@ -971,18 +971,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # encoder outputs.
         encoder_outputs = []
 
-        grouped_info = list(group_mm_kwargs_by_modality(
-            mm_kwargs,
-            device=self.device,
-            pin_memory=True,
-        ))
-        if self.enable_mm_timing:
-            cpu_pre_time_mid = time.perf_counter()
-
         do_mem = self.enable_mm_mem
         if do_mem:
             torch.npu.reset_peak_memory_stats()
-        for _, num_items, mm_kwargs_group in grouped_info:
+        for _, num_items, mm_kwargs_group in group_mm_kwargs_by_modality(
+            mm_kwargs,
+            device=self.device,
+            pin_memory=True,
+        ):
             # Run the encoder.
             # `curr_group_outputs` is either of the following:
             # 1. A tensor of shape (num_items, feature_size, hidden_size)
@@ -990,6 +986,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # 2. A list or tuple (length: num_items) of tensors, each of shape
             # (feature_size, hidden_size) in case the feature size is dynamic
             # depending on the input multimodal items.
+            
             # NPU Event: record the encoding section
             if self.enable_mm_timing:
                 enc_start_evt = torch.npu.Event(enable_timing=True)
