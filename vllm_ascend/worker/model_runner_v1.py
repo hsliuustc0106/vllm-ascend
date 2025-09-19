@@ -372,7 +372,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             dtype=torch.bool,
             device=self.device,
         )
-        # ---------------- NEW: Timing related switches and data structures ----------------
+        # ---------------- Timing related switches and data structures ----------------
         # Switch for basic timing of multimodal and LLM stages
         self.enable_mm_timing = bool(int(os.environ.get("VLLM_ASCEND_MM_TIMING", "0")))
         # measure TTFT
@@ -986,7 +986,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # 2. A list or tuple (length: num_items) of tensors, each of shape
             # (feature_size, hidden_size) in case the feature size is dynamic
             # depending on the input multimodal items.
-            
+
             # NPU Event: record the encoding section
             if self.enable_mm_timing:
                 enc_start_evt = torch.npu.Event(enable_timing=True)
