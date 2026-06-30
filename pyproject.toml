@@ -1,0 +1,19 @@
+[build-system]
+# Should be mirrored in requirements.txt
+requires = [
+    "cmake>=3.26",
+    "decorator",
+    "numpy<2.0.0",
+    "packaging",
+    "pip",
+    "pybind11",
+    "pyyaml",
+    "scipy",
+    "setuptools>=64",
+    "setuptools-scm>=8",
+    "torch-npu==2.5.1",
+    "torch>=2.5.1",
+    "torchvision<0.21.0",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
